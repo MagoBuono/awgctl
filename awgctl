@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# awgctl — управление клиентами AmneziaWG 3.1
+set -euo pipefail
+
+# ---- Настройки (переопределяются переменными окружения) ----
+# AWG_IF, AWG_PORT, AWG_NET, AWG_NET6, AWG_MTU учитываются только при init и сохраняются
+# в БД (таблица meta); остальные команды берут их оттуда, env на них уже не влияет.
+AWG_IF="${AWG_IF:-awg0}"
+SRV_PORT="${AWG_PORT:-51820}"
+NET_PREFIX="${AWG_NET:-10.12.13}"          # сеть /24, сервер = .1
+NET6="${AWG_NET6:-}"                        # /64 без "::", напр. fd12:3456:789a; пусто = случайная ULA, off = без IPv6
+CLIENT_DNS="${AWG_DNS:-1.1.1.1, 8.8.8.8}"
+MTU="${AWG_MTU:-1280}"                      # S4 + trailers + content padding съедают место; < 1280 нельзя из-за IPv6
+DB_DIR="${AWGCTL_DB_DIR:-/var/lib/awgctl}"
+DB="$DB_DIR/awgctl.db"
+SRV_KEY="$DB_DIR/server.key"
+AWG_CONF_DIR="${AWG_CONF_DIR:-/etc/amnezia/amneziawg}"
+CONF="$AWG_CONF_DIR/$AWG_IF.conf"
+# Только для init:
+#   AWG_ENDPOINT=vpn.example.com   — если сервер за NAT или есть домен
+#   AWG_I1='<b 0x...><r 16>'       — CPS-сигнатура перед handshake (по умолчанию нет)
+#   AWG_DISABLE_COOKIES=on|off     — по умолчанию on (см. комментарий в gen_params)
+
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+usage() {
+	cat <<-EOF
+	Usage: awgctl <command> [args]
+	  init              create DB, AWG 3.1 params, server config and bring $AWG_IF up
+	  create <name>     add client and print its config (QR too, if qrencode is installed)
+	  delete <name>     remove client
+	  list              list clients from DB
+	  show              awg show with peer keys replaced by names
+	  params            print obfuscation parameters
+	EOF
+}
+
+sql()  { sqlite3 -batch "$DB" "$@"; }
+rnd()  { shuf -i "$1-$2" -n 1; }
+getp() { sql "SELECT value FROM params WHERE key='$1';"; }
+
+check_name() {
+	[[ -n "${1:-}" ]] || die "missing client name. Usage: awgctl $action <name>"
+	[[ "$1" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "name may contain only A-Z a-z 0-9 _ . - (max 32 chars)"
+}
+
+check_deps() {
+	local missing=() c
+	for c in awg awg-quick sqlite3 ip iptables ip6tables shuf; do
+		command -v "$c" &>/dev/null || missing+=("$c")
+	done
+	((${#missing[@]} == 0)) || die "not installed: ${missing[*]} (packages: amneziawg, amneziawg-tools, sqlite3, iproute2, iptables)"
+}
+
+# true, если версия "X.Y..." >= 3.1
+ver_ge_31() { [[ "$1" =~ ^([0-9]+)\.([0-9]+) ]] && (( BASH_REMATCH[1] > 3 || (BASH_REMATCH[1] == 3 && BASH_REMATCH[2] >= 1) )); }
+
+check_version() {
+	local tools mod
+	tools=$(awg --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+[^ ]*' | head -n1 || true)
+	ver_ge_31 "${tools#v}" || die "amneziawg-tools ${tools:-unknown} is too old, 3.1+ required"
+	# Спрашиваем загруженный модуль, а не файл на диске (modinfo может показать другой .ko)
+	if [[ -r /sys/module/amneziawg/version ]]; then
+		mod=$(</sys/module/amneziawg/version)
+		ver_ge_31 "$mod" || die "loaded amneziawg module is $mod, 3.1+ required (reboot or reload the module after upgrade)"
+	else
+		warn "amneziawg kernel module is not loaded; make sure it is 3.1+ (or amneziawg-go 3.1+ is used)"
+	fi
+}
+
+check_db() { [[ -f "$DB" ]] || die "DB not found at $DB — run 'awgctl init' first"; load_meta; }
+
+meta() { sql "SELECT value FROM meta WHERE key='$1';"; }
+
+# Настройки сервера, зафиксированные при init. В БД от старых версий их нет —
+# тогда остаются значения из env/по умолчанию, а IPv6 выключен.
+load_meta() {
+	local k v
+	NET6=""
+	while IFS='|' read -r k v; do
+		case "$k" in
+			if)   AWG_IF=$v ;;
+			port) SRV_PORT=$v ;;
+			net)  NET_PREFIX=$v ;;
+			net6) NET6=$v ;;
+			mtu)  MTU=$v ;;
+		esac
+	done < <(sql "SELECT key, value FROM meta;")
+	CONF="$AWG_CONF_DIR/$AWG_IF.conf"
+}
+
+# ---- Параметры AWG 3.1 ----
+# Формат вывода: "<scope> <Key>=<value>", scope: both — сервер и клиенты, server — только сервер.
+gen_params() {
+	local jmin s
+	jmin=$(rnd 40 89)
+	echo "both Jc=$(rnd 3 6)"
+	echo "both Jmin=$jmin"
+	echo "both Jmax=$(rnd $((jmin + 50)) $((jmin + 250)))"
+
+	# Header Protection берёт nonce из первых 12 байт паддинга => S1-S4 >= 12.
+	# При RandomTrailers апстрим рекомендует одинаковые S1-S4, иначе возможна
+	# ошибка определения типа пакета.
+	s=$(rnd 16 40)
+	echo "both S1=$s"; echo "both S2=$s"; echo "both S3=$s"; echo "both S4=$s"
+
+	# С Header Protection тип сообщения скрыт шифрованием, и апстрим рекомендует
+	# оставлять H1-H4 стандартными (1-4 = механизм кастомных заголовков выключен).
+	echo "both H1=1"; echo "both H2=2"; echo "both H3=3"; echo "both H4=4"
+
+	echo "both HeaderProtectionKey=$(awg genkey)"
+	echo "both RandomTrailers=on"               # обязан совпадать на обеих сторонах
+	echo "both ContentPaddingAddition=$(rnd 4 12)-$(rnd 32 64)"
+
+	# Таймеры: при каждом использовании берётся случайное значение из диапазона.
+	# Стандартный WG: rekey 120, reject 180, keepalive 10, rekey-timeout 5, attempts 18.
+	# Держим RejectAfterTime.lo > RekeyAfterTime.hi + KeepaliveTimeout.hi + RekeyTimeout.hi,
+	# иначе сессия может истечь раньше, чем успеет пройти rekey.
+	echo "both RekeyAfterTime=$(rnd 100 110)-$(rnd 115 125)"
+	echo "both RekeyTimeout=$(rnd 3 4)-$(rnd 6 7)"
+	echo "both KeepaliveTimeout=$(rnd 8 10)-$(rnd 12 15)"
+	echo "both RejectAfterTime=$(rnd 160 170)-$(rnd 175 190)"
+	echo "both MaxHandshakeAttempts=$(rnd 15 17)-$(rnd 19 22)"
+
+	[[ -n "${AWG_I1:-}" ]] && echo "both I1=$AWG_I1"
+
+	# DisableCookies односторонний: сервер перестаёт слать Cookie Reply, который можно
+	# использовать как отпечаток при активном зондировании. Цена — теряется штатная
+	# защита WireGuard от флуда handshake'ами с подделанных адресов.
+	echo "server DisableCookies=${AWG_DISABLE_COOKIES:-on}"
+}
+
+# Блок параметров для [Interface]; $1 = both (клиент) или server (сервер: both + server)
+params_block() {
+	local where="scope='both'"
+	[[ "$1" == server ]] && where="scope IN ('both','server')"
+	sql "SELECT key || ' = ' || value FROM params WHERE $where ORDER BY rowid;"
+}
+
+# Правила для PostUp ($1=up) / PostDown ($1=down).
+# IPv6 в туннеле — ULA + NAT66: адрес сервера /48 висит on-link на внешнем интерфейсе,
+# и раздать клиентам кусок из него без NDP proxy нельзя.
+# Без IPv6 на сервере (srv_if6 пуст) NAT66 не ставим: v6 клиентов упирается в туннель
+# и хотя бы не утекает мимо него.
+fw_rules() {
+	local ins=-D app=-D ipt srv_if srv_if6 out rules=()
+	[[ "$1" == up ]] && { ins=-I; app=-A; }
+	srv_if=$(meta srv_if)
+	srv_if6=$(meta srv_if6)
+	for ipt in iptables ${NET6:+ip6tables}; do
+		rules+=("$ipt $ins FORWARD -i %i -j ACCEPT"
+			"$ipt $ins FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+	done
+	rules+=("iptables -t nat $app POSTROUTING -s $NET_PREFIX.0/24 -o $srv_if -j MASQUERADE")
+	if [[ -n "$NET6" && -n "$srv_if6" ]]; then
+		rules+=("ip6tables -t nat $app POSTROUTING -s $NET6::/64 -o $srv_if6 -j MASQUERADE")
+	fi
+	out=$(printf '%s; ' "${rules[@]}")
+	echo "${out%; }"
+}
+
+# Серверный конфиг целиком собирается из БД (без SaveConfig / awg-quick save)
+write_server_conf() {
+	local tmp
+	tmp=$(mktemp "$AWG_CONF_DIR/.$AWG_IF.XXXXXX")   # mktemp создаёт файл с правами 600
+	{
+		cat <<-EOF
+			[Interface]
+			Address = $NET_PREFIX.1/24${NET6:+, $NET6::1/64}
+			ListenPort = $SRV_PORT
+			MTU = $MTU
+			PrivateKey = $(cat "$SRV_KEY")
+			PostUp = $(fw_rules up)
+			PostDown = $(fw_rules down)
+		EOF
+		params_block server
+		sql "SELECT id, user, pubkey, ip FROM users WHERE id<>1 ORDER BY id;" |
+			while IFS='|' read -r id u k ip; do
+				printf '\n[Peer]\n# %s\nPublicKey = %s\nAllowedIPs = %s/32%s\n' \
+					"$u" "$k" "$ip" "${NET6:+, $NET6::$id/128}"
+			done
+	} >"$tmp"
+	mv -f "$tmp" "$CONF"
+}
+
+# Применить пиры к живому интерфейсу без перезапуска
+apply_conf() { awg syncconf "$AWG_IF" <(awg-quick strip "$CONF"); }
+
+cmd_init() {
+	[[ -f "$DB" ]] && die "already initialized ($DB exists)"
+	[[ -f "$CONF" ]] && die "$CONF already exists, refusing to overwrite"
+	[[ "${AWG_DISABLE_COOKIES:-on}" =~ ^(on|off)$ ]] || die "AWG_DISABLE_COOKIES must be on or off"
+	[[ "${AWG_I1:-}" != *"'"* ]] || die "AWG_I1 must not contain quotes"
+	[[ "$SRV_PORT" =~ ^[0-9]+$ ]] && ((SRV_PORT >= 1 && SRV_PORT <= 65535)) || die "AWG_PORT must be 1-65535"
+	# Ядро не включает IPv6 на интерфейсе с MTU < 1280, и awg-quick упадёт на Address
+	[[ "$MTU" =~ ^[0-9]+$ ]] || die "AWG_MTU must be a number"
+	((MTU >= 1280)) || [[ "$NET6" == off ]] || die "AWG_MTU must be >= 1280 (IPv6 minimum), or set AWG_NET6=off"
+	case "$NET6" in
+		off) NET6="" ;;
+		"")  NET6=$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n' | sed -E 's/^(..)(....)(....)$/fd\1:\2:\3/') ;;
+		*)   [[ "$NET6" =~ ^[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4}){2,3}$ ]] ||
+				die "AWG_NET6 must be a /64 prefix without '::' (e.g. fd12:3456:789a), or off" ;;
+	esac
+	check_version
+
+	local srv_if srv_if6 srv_ip endpoint srv_pub
+	srv_if=$(ip -o -4 route show to default | awk '{print $5; exit}')
+	[[ -n "$srv_if" ]] || die "cannot detect default route interface"
+	srv_ip=$(ip -o -4 address show dev "$srv_if" | awk '{split($4,a,"/"); print a[1]; exit}')
+	endpoint="${AWG_ENDPOINT:-$srv_ip}"
+	if [[ -z "${AWG_ENDPOINT:-}" && "$srv_ip" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
+		warn "$srv_ip is a private address. If the server is behind NAT, re-run with AWG_ENDPOINT=<public IP or domain>."
+	fi
+	srv_if6=$(ip -o -6 route show to default | awk '{print $5; exit}')
+	[[ -n "$NET6" && -z "$srv_if6" ]] &&
+		warn "no IPv6 default route: IPv6 inside the tunnel works, but clients get no IPv6 internet"
+
+	umask 077
+	mkdir -p "$DB_DIR" "$AWG_CONF_DIR"
+	chmod 700 "$DB_DIR"
+	# Если дальше что-то упадёт, убираем созданное, иначе повторный init откажется работать
+	trap init_rollback EXIT
+	awg genkey >"$SRV_KEY"
+	srv_pub=$(awg pubkey <"$SRV_KEY")
+
+	{
+		cat <<-EOF
+			CREATE TABLE users (
+			  id     INTEGER PRIMARY KEY,
+			  user   TEXT NOT NULL UNIQUE,
+			  pubkey TEXT NOT NULL UNIQUE,
+			  ip     TEXT NOT NULL UNIQUE,
+			  extip  TEXT
+			);
+			CREATE TABLE params (key TEXT PRIMARY KEY, value TEXT NOT NULL, scope TEXT NOT NULL);
+			CREATE TABLE meta   (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+			INSERT INTO users(id,user,pubkey,ip,extip)
+			VALUES (1,'Server_$srv_if','$srv_pub','$NET_PREFIX.1','$endpoint');
+			INSERT INTO meta VALUES ('srv_if','$srv_if'), ('srv_if6','$srv_if6'), ('if','$AWG_IF'),
+			  ('port','$SRV_PORT'), ('net','$NET_PREFIX'), ('net6','$NET6'), ('mtu','$MTU');
+		EOF
+		gen_params | while read -r scope kv; do
+			printf "INSERT INTO params(key,value,scope) VALUES ('%s','%s','%s');\n" "${kv%%=*}" "${kv#*=}" "$scope"
+		done
+	} | sql
+
+	write_server_conf
+
+	# Без форвардинга клиенты подключатся, но интернета не будет.
+	# С forwarding=1 ядро перестаёт принимать RA на интерфейсах с accept_ra=1 — если
+	# IPv6-маршрут сервера пришёл по RA, он бы через пару минут пропал. accept_ra=2 это чинит.
+	{
+		echo "net.ipv4.ip_forward = 1"
+		if [[ -n "$NET6" ]]; then
+			echo "net.ipv6.conf.all.forwarding = 1"
+			if ip -6 route show to default | grep -qw 'proto ra'; then
+				echo "net.ipv6.conf.$srv_if6.accept_ra = 2"
+			fi
+		fi
+	} >/etc/sysctl.d/99-awgctl.conf
+	sysctl -q -p /etc/sysctl.d/99-awgctl.conf
+
+	# Поднимаем через юнит, а не awg-quick напрямую: иначе юнит остаётся inactive,
+	# и systemctl restart/stop awg-quick@$AWG_IF потом не работают
+	if has_systemd; then
+		systemctl enable --now "awg-quick@$AWG_IF" || {
+			journalctl -u "awg-quick@$AWG_IF" -n 10 --no-pager -o cat >&2 || true
+			die "failed to start awg-quick@$AWG_IF, rolled back"
+		}
+	else
+		awg-quick up "$AWG_IF"
+	fi
+	trap - EXIT
+	echo "Server ready: $AWG_IF (AWG 3.1), endpoint $endpoint:$SRV_PORT"
+}
+
+has_systemd() { command -v systemctl &>/dev/null && [[ -d /run/systemd/system ]]; }
+
+init_rollback() {
+	[[ $? -eq 0 ]] && return
+	warn "init failed, removing $DB, $SRV_KEY, $CONF"
+	if has_systemd; then
+		systemctl disable "awg-quick@$AWG_IF" &>/dev/null || true
+		systemctl reset-failed "awg-quick@$AWG_IF" &>/dev/null || true
+	fi
+	rm -f "$DB" "$SRV_KEY" "$CONF"
+}
+
+next_free_id() {
+	local used i
+	used=$(sql "SELECT id FROM users;")
+	for i in $(seq 2 254); do
+		grep -qx "$i" <<<"$used" || { echo "$i"; return 0; }
+	done
+	return 1
+}
+
+cmd_create() {
+	local name="$1" id ip priv pub srv_pub endpoint conf
+	check_db
+	[[ -z "$(sql "SELECT 1 FROM users WHERE user='$name';")" ]] || die "client '$name' already exists"
+	id=$(next_free_id) || die "no free addresses left in $NET_PREFIX.0/24"
+	ip="$NET_PREFIX.$id"
+	priv=$(awg genkey)
+	pub=$(awg pubkey <<<"$priv")
+
+	sql "INSERT INTO users(id,user,pubkey,ip) VALUES ($id,'$name','$pub','$ip');"
+	write_server_conf
+	if ! apply_conf; then
+		sql "DELETE FROM users WHERE id=$id;"
+		write_server_conf
+		die "failed to apply config to $AWG_IF, rolled back"
+	fi
+
+	srv_pub=$(sql "SELECT pubkey FROM users WHERE id=1;")
+	endpoint=$(sql "SELECT extip FROM users WHERE id=1;")
+	conf=$(
+		printf '[Interface]\nPrivateKey = %s\nAddress = %s/32%s\nDNS = %s\nMTU = %s\n' \
+			"$priv" "$ip" "${NET6:+, $NET6::$id/128}" "$CLIENT_DNS" "$MTU"
+		params_block both
+		printf '\n[Peer]\nPublicKey = %s\nEndpoint = %s:%s\nAllowedIPs = 0.0.0.0/0%s\nPersistentKeepalive = 25\n' \
+			"$srv_pub" "$endpoint" "$SRV_PORT" "${NET6:+, ::/0}"
+	)
+	echo "$conf"
+	if [[ -t 1 ]] && command -v qrencode &>/dev/null; then
+		echo
+		qrencode -t ansiutf8 <<<"$conf"
+	fi
+}
+
+cmd_delete() {
+	local name="$1" row
+	check_db
+	row=$(sql "SELECT id FROM users WHERE user='$name' AND id<>1;")
+	[[ -n "$row" ]] || die "client '$name' not found"
+	sql "DELETE FROM users WHERE id=$row;"
+	write_server_conf
+	apply_conf || die "DB and $CONF updated, but applying to $AWG_IF failed; run: systemctl restart awg-quick@$AWG_IF"
+	echo "Client '$name' removed"
+}
+
+cmd_list() {
+	check_db
+	local ip6="NULL"
+	[[ -n "$NET6" ]] && ip6="'$NET6::' || id"
+	sqlite3 -batch -header -column -cmd ".width 25 15 22 0" "$DB" \
+		"SELECT user, ip, $ip6 AS ip6, pubkey FROM users WHERE id<>1 ORDER BY id;"
+}
+
+cmd_show() {
+	check_db
+	local -A names=()
+	local u k line
+	while IFS='|' read -r u k; do
+		names["$k"]="$u"
+	done < <(sql -separator '|' "SELECT user, pubkey FROM users WHERE id<>1;")
+
+	awg show "$AWG_IF" | while IFS= read -r line; do
+		if [[ "$line" =~ ^peer:\ (.+)$ && -n "${names[${BASH_REMATCH[1]}]:-}" ]]; then
+			echo "peer: ${names[${BASH_REMATCH[1]}]}"
+		else
+			echo "$line"
+		fi
+	done
+}
+
+cmd_params() {
+	check_db
+	echo "# shared (server + clients):"
+	params_block both
+	echo "# server only:"
+	sql "SELECT key || ' = ' || value FROM params WHERE scope='server' ORDER BY rowid;"
+}
+
+# ---- main ----
+action="${1:-help}"
+shift || true
+
+case "$action" in
+	help|-h|--help) usage; exit 0 ;;
+esac
+
+[[ $EUID -eq 0 ]] || die "run as root"
+check_deps
+
+case "$action" in
+	init)   cmd_init ;;
+	create) check_name "${1:-}"; cmd_create "$1" ;;
+	delete) check_name "${1:-}"; cmd_delete "$1" ;;
+	list)   cmd_list ;;
+	show)   cmd_show ;;
+	params) cmd_params ;;
+	*)      usage >&2; exit 1 ;;
+esac
